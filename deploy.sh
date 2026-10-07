@@ -12,7 +12,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TERRAFORM_DIR="${MCP_TERRAFORM_DIR:-$SCRIPT_DIR/../mcp-server-terraform}"
 HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-300}"
-CLAUDE_CONFIG_PATH="${CLAUDE_CONFIG_PATH:-$HOME/Library/Application Support/Claude/claude_desktop_config.json}"
+# Windows (Git Bash) keeps the Claude Desktop config under %APPDATA%; everything else uses the macOS path.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*) PLATFORM=windows; DEFAULT_CLAUDE_CONFIG="$APPDATA/Claude/claude_desktop_config.json" ;;
+  *)                    PLATFORM=macos;   DEFAULT_CLAUDE_CONFIG="$HOME/Library/Application Support/Claude/claude_desktop_config.json" ;;
+esac
+CLAUDE_CONFIG_PATH="${CLAUDE_CONFIG_PATH:-$DEFAULT_CLAUDE_CONFIG}"
 
 step() { printf '\n==> %s\n' "$*"; }
 ok()   { printf '    OK  %s\n' "$*"; }
@@ -28,7 +33,11 @@ NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
 ok "terraform, aws, curl, python3, node $(node -v), npx"
 
 # Claude Desktop rewrites its config file from memory while it runs, which would drop our entry.
-if ps -axo comm= | grep '/Claude\.app/Contents/MacOS/Claude$' >/dev/null; then
+if [[ "$PLATFORM" == windows ]]; then
+  if tasklist //FI "IMAGENAME eq Claude.exe" 2>/dev/null | grep -i 'claude\.exe' >/dev/null; then
+    fail "Claude Desktop is running. Quit it from the system tray (right-click > Quit), then re-run ./deploy.sh."
+  fi
+elif ps -axo comm= | grep '/Claude\.app/Contents/MacOS/Claude$' >/dev/null; then
   fail "Claude Desktop is running. Quit it completely (Cmd+Q), then re-run ./deploy.sh."
 fi
 ok "Claude Desktop is not running"
@@ -145,7 +154,8 @@ step "Writing the Claude Desktop configuration"
 # mcp-remote stdio bridge. Claude Desktop doesn't load your shell PATH, so use the absolute npx
 # path and put node's directory on PATH for it: npx starts with `#!/usr/bin/env node`.
 # The token goes in env.AUTH_HEADER; mcp-remote expands ${AUTH_HEADER} in its --header argument.
-python3 - "$CLAUDE_CONFIG_PATH" "$MCP_SERVER_URL" "$(command -v npx)" "$(dirname "$(command -v node)")" <<'PY'
+# On Windows, Claude Desktop starts npx through `cmd /c`, which finds npx on the Windows PATH.
+python3 - "$CLAUDE_CONFIG_PATH" "$MCP_SERVER_URL" "$(command -v npx)" "$(dirname "$(command -v node)")" "$PLATFORM" <<'PY'
 import json
 import os
 import pathlib
@@ -156,6 +166,7 @@ config_path = pathlib.Path(sys.argv[1])
 server_url = sys.argv[2]
 npx_path = sys.argv[3]
 node_dir = sys.argv[4]
+platform = sys.argv[5]
 config_path.parent.mkdir(parents=True, exist_ok=True)
 
 if config_path.exists():
@@ -175,18 +186,31 @@ if server_url.startswith("http://"):
 # No space after the colon: Claude Desktop splits args with spaces on some platforms.
 args += ["--header", "Authorization:${AUTH_HEADER}"]
 
-servers["aiops-eks"] = {
-    "command": npx_path,
-    "args": args,
-    "env": {
-        "PATH": f"{node_dir}:/usr/bin:/bin:/usr/sbin:/sbin",
-        "AUTH_HEADER": f"Bearer {os.environ['MCP_AUTH_TOKEN']}",
-    },
-}
+if platform == "windows":
+    servers["aiops-eks"] = {
+        "command": "cmd",
+        "args": ["/c", "npx"] + args,
+        "env": {"AUTH_HEADER": f"Bearer {os.environ['MCP_AUTH_TOKEN']}"},
+    }
+else:
+    servers["aiops-eks"] = {
+        "command": npx_path,
+        "args": args,
+        "env": {
+            "PATH": f"{node_dir}:/usr/bin:/bin:/usr/sbin:/sbin",
+            "AUTH_HEADER": f"Bearer {os.environ['MCP_AUTH_TOKEN']}",
+        },
+    }
 config_path.write_text(json.dumps(config, indent=2) + "\n")
 print(f"    OK  wrote aiops-eks to {config_path} (previous version saved as .json.bak)")
 print("    The config file now contains the MCP bearer token; don't share it.")
 PY
+
+if [[ "$PLATFORM" == windows ]]; then
+  CLAUDE_LOG='%APPDATA%\Claude\logs\mcp-server-aiops-eks.log'
+else
+  CLAUDE_LOG='tail -n 50 ~/Library/Logs/Claude/mcp-server-aiops-eks.log'
+fi
 
 cat <<EOF
 
@@ -196,5 +220,5 @@ cat <<EOF
     3. Try: "List the pods in the application namespace."
 
     If aiops-eks doesn't appear, check:
-      tail -n 50 ~/Library/Logs/Claude/mcp-server-aiops-eks.log
+      $CLAUDE_LOG
 EOF
