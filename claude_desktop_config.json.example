@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "aiops-eks": {
+      "command": "/path/to/node/bin/npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "http://<alb-dns-name>:8080/mcp",
+        "--allow-http",
+        "--header",
+        "Authorization:${AUTH_HEADER}"
+      ],
+      "env": {
+        "PATH": "/path/to/node/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "AUTH_HEADER": "Bearer <token-from-ssm>"
+      }
+    }
+  }
+}
